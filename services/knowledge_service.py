@@ -11,13 +11,20 @@ from pathlib import Path
 
 from config.settings import settings
 from models.document import Document, DocumentStatus
-from models.knowledge import KnowledgeGraph, Entity, Relation, EntityType, RelationType
+from models.knowledge import KnowledgeGraph, EntityList,RelationList,Entity,Relation
 from utils.logger import get_logger
 from utils.api_utils import DeepSeekClient
 from api.client import MockAPIClient
+from pydantic import BaseModel
 
 logger = get_logger(__name__)
 
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.output_parsers import PydanticOutputParser
 
 class KnowledgeService:
     """知识图谱服务"""
@@ -263,7 +270,7 @@ class KnowledgeService:
         except Exception as e:
             logger.error(f"读取文档内容失败: {str(e)}")
             raise
-
+    
     def _extract_knowledge_with_llm(self, content: str, source_doc_id: str) -> KnowledgeGraph:
         """
         使用大模型从内容中抽取知识
@@ -275,21 +282,28 @@ class KnowledgeService:
         Returns:
             抽取的知识图谱
         """
-        # 构建提示词
-        prompt = self._build_extraction_prompt(content)
 
+        parser_Entity = PydanticOutputParser(pydantic_object=EntityList)
+
+        # 获取 LLM 提示中要求的输出格式说明
+        format_instructions = parser_Entity.get_format_instructions()
+
+        # 构建提示词
+        
+        prompt_Entity = self.build_entity_extraction_prompt(content,format_instructions,source_doc_id)
         # 调用大模型
         try:
-            response = self.llm_client.chat_completion(
+            response_Entity = self.llm_client.chat_completion(
                 messages=[
                     {"role": "system", "content": "你是一个专业的知识图谱工程师，擅长从非结构化文本中抽取结构化信息，并转换为 Neo4j 图数据库的 Cypher 查询语言。"},
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": prompt_Entity}
                 ],
                 temperature=0.2,
-                max_tokens=4000
+                max_tokens=8000
             )
+            
         except Exception as e:
-            logger.error(f"大模型调用失败: {str(e)}")
+            logger.error(f"实体抽取失败: {str(e)}")
             # 这里不能直接更新文档状态，因为document变量不在这个方法的参数中
             # 返回一个空的知识图谱
             return KnowledgeGraph(
@@ -302,11 +316,12 @@ class KnowledgeService:
 
         # 解析响应
         try:
-            result_text = response["choices"][0]["message"]["content"]
+            result_text_entity = response_Entity["choices"][0]["message"]["content"]
+            
             # 确保文本是UTF-8编码
-            if isinstance(result_text, str):
-                result_text = result_text.encode('utf-8', errors='ignore').decode('utf-8')
-            kg_data = self._parse_llm_response(result_text)
+            if isinstance(result_text_entity, str):
+                result_text = result_text_entity.encode('utf-8', errors='ignore').decode('utf-8')
+              
         except (KeyError, IndexError, UnicodeError) as e:
             logger.error(f"解析大模型响应失败: {str(e)}")
             # 返回一个空的知识图谱
@@ -317,364 +332,258 @@ class KnowledgeService:
                 relations=[],
                 metadata={"error": f"解析响应失败: {str(e)}"}
             )
+        parser_Relation = PydanticOutputParser(pydantic_object=RelationList)
 
-        # 处理新格式的关系数据（from/to -> source/target）
-        relations_data = []
-        for rel in kg_data.get("relations", []):
-            if "from" in rel and "to" in rel:
-                # 新格式：使用from/to
-                # 映射关系类型
-                relation_type = self._map_relation_type(rel.get("type", "other"))
-                relations_data.append({
-                    "id": rel.get("id", f"{rel['from']}-{rel['to']}-{rel['type']}"),
-                    "source": rel["from"],
-                    "target": rel["to"],
-                    "type": relation_type,
-                    "description": rel.get("description", ""),
-                    "properties": rel.get("properties", {})
-                })
-            else:
-                # 旧格式：直接使用source/target
-                # 映射关系类型
-                if "type" in rel:
-                    rel["type"] = self._map_relation_type(rel["type"])
-                relations_data.append(rel)
+        # 获取 LLM 提示中要求的输出格式说明
+        format_instructions_relation = parser_Relation.get_format_instructions()
 
-        # 处理实体类型映射
-        entities_data = []
-        for entity in kg_data.get("entities", []):
-            # 映射实体类型
-            entity_type = self._map_entity_type(entity.get("type", "other"))
-            entity["type"] = entity_type
-            entities_data.append(entity)
+        # 构建提示词
+        result_text = result_text_entity.strip()
+        if result_text.startswith("```"):
+            result_text = result_text.strip("`")
+            if result_text.startswith("json"):
+                result_text = result_text[4:].strip()
 
-        # 创建知识图谱
-        kg = KnowledgeGraph(
-            id=f"kg_{source_doc_id}_{int(time.time())}",
-            name=f"知识图谱_{source_doc_id}",
-            description=f"从文档 {source_doc_id} 中抽取的知识",
-            entities=[Entity.from_dict(e) for e in entities_data],
-            relations=[Relation.from_dict(r) for r in relations_data],
-            metadata={
-                "source_document": source_doc_id,
-                "cypher_statements": kg_data.get("cypher_statements", [])
+        # 转换为 Python 对象
+        data_entity = json.loads(result_text)
+
+        # 只保留部分字段
+        filtered_data = [
+            {
+                "id":  item.get('id') ,
+                "name": item.get("name"),
+                "type": item.get("type"),
             }
-        )
+            for item in data_entity
+        ]
+        
+        prompt_Relation = self.build_relation_extraction_prompt(content,filtered_data,format_instructions_relation)
 
-        return kg
+        try:
+            response_Relation = self.llm_client.chat_completion(
+                messages=[
+                    {"role": "system", "content": "你是一个专业的知识图谱工程师，擅长从非结构化文本中抽取结构化信息，并转换为 Neo4j 图数据库的 Cypher 查询语言。"},
+                    {"role": "user", "content": prompt_Relation}
+                ],
+                temperature=0.2,
+                max_tokens=8000
+            )
+            
+        except Exception as e:
+            logger.error(f"关系抽取失败: {str(e)}")
+            # 这里不能直接更新文档状态，因为document变量不在这个方法的参数中
+            # 返回一个空的知识图谱
+            return KnowledgeGraph(
+                id=f"error_{source_doc_id}",
+                name=f"Error Knowledge Graph for {source_doc_id}",
+                entities=[],
+                relations=[],
+                metadata={"error": f"大模型调用失败: {str(e)}"}
+            )
 
-    def _map_entity_type(self, entity_type: str) -> str:
+        # 解析响应
+        try:
+            result_text_relation = response_Relation["choices"][0]["message"]["content"]
+            # 确保文本是UTF-8编码
+            if isinstance(result_text, str):
+                result_text = result_text.encode('utf-8', errors='ignore').decode('utf-8')
+               
+        except (KeyError, IndexError, UnicodeError) as e:
+            logger.error(f"解析大模型响应失败: {str(e)}")
+            # 返回一个空的知识图谱
+            return KnowledgeGraph(
+                id=f"error_{source_doc_id}",
+                name=f"Error Knowledge Graph for {source_doc_id}",
+                entities=[],
+                relations=[],
+                metadata={"error": f"解析响应失败: {str(e)}"}
+            )
+        result_text = result_text_relation.strip()
+        if result_text.startswith("```"):
+            result_text = result_text.strip("`")
+            if result_text.startswith("json"):
+                result_text = result_text[4:].strip()
+
+        # 转换为 Python 对象
+        data_relation = json.loads(result_text)
+        print(data_relation)
+        cypher_statements =self._generate_cypher(data_entity,data_relation,source_doc_id)
+        kg_data = KnowledgeGraph(
+                id=f"kg_{source_doc_id}_{int(time.time())}",
+                name=f"知识图谱_{source_doc_id}",
+                entities=[Entity.from_dict(e) for e in data_entity],
+                relations=[Relation.from_dict(a) for a in data_relation],
+                description=f"从文档 {source_doc_id} 中抽取的知识",
+                metadata={
+                "source_document": source_doc_id,
+                "cypher_statements": cypher_statements
+            }
+            )
+
+        return kg_data
+
+
+    def _generate_cypher(self, entities: List[Dict], relations: List[Dict],doc_id) -> List[str]:
         """
-        映射实体类型到预定义的类型
+        根据实体和关系生成 Neo4j 的 Cypher 语句
 
         Args:
-            entity_type: 原始实体类型
+            entities: List[Dict]，每个字典至少包含 id, name, type, properties
+            relations: List[Dict]，每个字典至少包含 source_id, target_id, type
+            doc_id: 来源文档ID
 
         Returns:
-            映射后的实体类型
+            List[str]，Cypher 语句列表
         """
-        # 类型映射字典
-        type_mapping = {
-            # 人员相关
-            "person": "person",
-            "people": "person",
-            "worker": "person",
-            "operator": "person",
-            "technician": "person",
-            "engineer": "person",
-            # 首字母大写变体
-            "Person": "person",
-            "People": "person",
-            "Worker": "person",
-            "Operator": "person",
-            "Technician": "person",
-            "Engineer": "person",
-            
-            # 工具相关
-            "tool": "tool",
-            "tools": "tool",
-            "instrument": "tool",
-            "device": "tool",
-            "equipment": "equipment",
-            # 首字母大写变体
-            "Tool": "tool",
-            "Tools": "tool",
-            "Instrument": "tool",
-            "Device": "tool",
-            "Equipment": "equipment",
-            
-            # 设备相关
-            "machine": "equipment",
-            "motor": "equipment",
-            "pump": "equipment",
-            "valve": "equipment",
-            "belt": "equipment",
-            "conveyor": "equipment",
-            # 首字母大写变体
-            "Machine": "equipment",
-            "Motor": "equipment",
-            "Pump": "equipment",
-            "Valve": "equipment",
-            "Belt": "equipment",
-            "Conveyor": "equipment",
-            
-            # 部件相关
-            "component": "component",
-            "part": "component",
-            "assembly": "component",
-            # 首字母大写变体
-            "Component": "component",
-            "Part": "component",
-            "Assembly": "component",
-            
-            # 工序相关
-            "procedure": "procedure",
-            "process": "procedure",
-            "operation": "procedure",
-            "step": "procedure",
-            # 首字母大写变体
-            "Procedure": "procedure",
-            "Process": "procedure",
-            "Operation": "procedure",
-            "Step": "procedure",
-            
-            # 材料相关
-            "material": "material",
-            "substance": "material",
-            "oil": "material",
-            "lubricant": "material",
-            # 首字母大写变体
-            "Material": "material",
-            "Substance": "material",
-            "Oil": "material",
-            "Lubricant": "material",
-            
-            # 位置相关
-            "location": "location",
-            "place": "location",
-            "position": "location",
-            "site": "location",
-            # 首字母大写变体
-            "Location": "location",
-            "Place": "location",
-            "Position": "location",
-            "Site": "location",
-            
-            # 时间相关
-            "time": "time",
-            "date": "time",
-            "period": "time",
-            "duration": "time",
-            # 首字母大写变体
-            "Time": "time",
-            "Date": "time",
-            "Period": "time",
-            "Duration": "time",
-            
-            # 其他
-            "other": "other",
-            "unknown": "other",
-            # 首字母大写变体
-            "Other": "other",
-            "Unknown": "other"
-        }
-        
-        # 首先尝试直接映射（支持大小写变体）
-        if entity_type in type_mapping:
-            return type_mapping[entity_type]
-        
-        # 转换为小写并查找映射
-        normalized_type = entity_type.lower().strip()
-        if normalized_type in type_mapping:
-            return type_mapping[normalized_type]
-        
-        # 如果直接映射失败，尝试一些常见的变体
-        # 处理首字母大写的情况
-        if entity_type.capitalize() in ["Person", "Tool", "Equipment", "Component", "Procedure", "Standard", "Material", "Condition", "Error", "Cause", "Solution", "Maintenance", "Inspection", "Location", "Time"]:
-            return normalized_type
-        
-        # 如果都不匹配，返回other
-        return "other"
+        cypher_statements = []
 
-    def _map_relation_type(self, relation_type: str) -> str:
-        """
-        映射关系类型到预定义的类型
-
-        Args:
-            relation_type: 原始关系类型
-
-        Returns:
-            映射后的关系类型
-        """
-        # 关系类型映射字典
-        type_mapping = {
-            # 基本关系
-            "part_of": "part_of",
-            "used_in": "used_in",
-            "related_to": "related_to",
-            "causes": "causes",
-            "is_solution_for": "is_solution_for",
-            "requires": "requires",
-            "results_in": "results_in",
-            "checked_by": "checked_by",
-            "maintained_by": "maintained_by",
-            "follows": "follows",
-            "depends_on": "depends_on",
+        for e in entities:
+            node_label = e['type'].capitalize()
+            props = e.get("properties", {}).copy()
+            props["name"] = e["name"]  # 把name也放到属性里
+            # 转换为 Cypher Map 格式
+            props_text = ", ".join(f"{k}: '{v}'" for k, v in props.items())
             
-            # 新增关系类型
-            "compiled_by": "compiled_by",
-            "compiled": "compiled_by",  # 处理COMPILED
-            "created_by": "created_by",
-            "created": "created_by",
-            "operated_by": "operated_by",
-            "operated": "operated_by",
-            "located_in": "located_in",
-            "located": "located_in",
-            "contains": "contains",
-            "belongs_to": "belongs_to",
-            "belongs": "belongs_to",
-            "connects_to": "connects_to",
-            "connects": "connects_to",
-            "replaces": "replaces",
-            "improves": "improves",
-            "prevents": "prevents",
-            
-            # 其他
-            "other": "other",
-            "unknown": "other"
-        }
-        
-        # 转换为小写并查找映射
-        normalized_type = relation_type.lower().strip()
-        
-        # 首先尝试直接映射
-        if normalized_type in type_mapping:
-            return type_mapping[normalized_type]
-        
-        # 如果直接映射失败，尝试一些常见的变体
-        # 处理首字母大写的情况
-        if relation_type.upper() in ["COMPILED", "CREATED", "OPERATED", "LOCATED", "BELONGS", "CONNECTS"]:
-            return normalized_type + "_by" if relation_type.upper() in ["COMPILED", "CREATED", "OPERATED"] else normalized_type
-        
-        # 如果都不匹配，返回other
-        return "other"
+            cypher = f"MERGE (n:{node_label} {{id: '{e['id']}_{doc_id}'}}) ON CREATE SET n += {{{props_text}}};"
+            cypher_statements.append(cypher)
 
-    def _build_extraction_prompt(self, content: str) -> str:
+
+
+        # 生成关系
+        for r in relations:
+            rel_type = r['type'].upper()  # 关系类型大写
+            cypher = (
+                f"MATCH (a {{id: '{r['source']}_{doc_id}'}}), (b {{id: '{r['target']}_{doc_id}'}}) "
+                f"MERGE (a)-[:{rel_type}]->(b);"
+                
+            )
+            cypher_statements.append(cypher)
+
+        return cypher_statements
+
+    def build_entity_extraction_prompt(self,content: str, format_instructions: str,source_doc_id: str) -> str:
+        return f"""
+    你是一个知识图谱实体抽取助手。请从以下文本中严格抽取**实体**，不需要关系。
+    ## 文档结构指南：
+    1. 项目基本信息：名称、编码、工期、危险源、动火等级等通常在文档顶部
+    2. 资源需求：工具列表通常标记为"需用工机具"，材料列表标记为"需用材料"
+    3. 人员配置：通常在"需要人数"或"工种代码"部分
+    4. 活动流程：按事件顺序排列的活动，包含描述、工时、作业方法和安全措施,并包括每个工序的所用材料和人员与工具，这是非常重要的关系.
+    5. 危险源也作为单独节点。
+
+    ## 要求：
+    - 仅输出实体，不包含关系。
+    - 每个实体必须有唯一 id,其格式为(节点的type)_(数字)。
+    - 必须标注实体类型（如 工具、材料、人员、活动、项目、危险源（hazrad）等）。
+    - 实体属性必须尽量完整，例如：名称、数量、单位、代码等。
+    - 工人应当属于role类型中
+    - 注意对后续步骤节点的提取
+    - 工序节点的properties要包含工时(duration),step,technology_point,safety_measures,还有作业方法。
+    - 注意每个工人应当有单独的节点来进行描述。
+    - 节点的属性不应包括符号：'[',']','{','}','''等。
+    - 输出必须符合以下格式：
+
+    {format_instructions}
+
+    ## 文档内容：
+    {content}
+    """
+
+    def build_relation_extraction_prompt(self,content: str,entities_list: str ,format_instructions: str) -> str:
+        return f"""
+    你是一个专业的知识图谱工程师，擅长从非结构化文本中抽取结构化关系信息。
+    请根据以下条件从给定文本中抽取实体之间的关系：
+
+    1. 已知实体列表（包含实体ID、名称和类型）：
+    {entities_list}
+
+    2. 关系类型及对应关键词：
+    part_of, used_in, related_to, causes, is_solution_for, requires, results_in,
+    checked_by, maintained_by, follows, depends_on, compiled_by, created_by,
+    operated_by, located_in, contains, belongs_to, connects_to, replaces,
+    improves, prevents, attention_to ,other
+
+    ## 文档结构指南：
+    1. 项目基本信息：名称、编码、工期、危险源、动火等级等通常在文档顶部
+    2. 资源需求：工具列表通常标记为"需用工机具"，材料列表标记为"需用材料"
+    3. 人员配置：通常在"需要人数"或"工种代码"部分
+    4. 活动流程：按事件顺序排列的活动，包含描述、工时、作业方法和安全措施,并包括每个工序的所用材料和人员与工具，这是非常重要的关系.
+
+    3. 输出要求：
+    - 仅输出 JSON 数组，格式为：
+    {format_instructions}
+    - 不要输出额外说明文字。
+    - 如果文本中没有关系，则输出空数组 []。
+    - type 必须是上面列出的关系类型之一
+    - 其中每个工序应当与其对应的人员（operated_by）、材料（used_in）、工具（used_in），建立所属关系
+    - 工序和工序之间有先后关系（follows） 
+    - 项目与工具的关联（used_in）、材料的关联（used_in）、人员的关联（operated_by）
+    - 项目与危险源的关联（attention_to）
+    4. 文本内容：
+    {content}
+
+    请根据文本和实体列表抽取所有明确的关系。
+
+    """
+
+    def _build_extraction_prompt(self, content: str, format_instructions: str) -> str:
         """
         构建知识抽取提示词
 
         Args:
             content: 文档内容
+            format_instructions: 输出格式
 
         Returns:
             提示词
         """
-        return f"""# 角色与任务
-你是一个专业的知识图谱工程师，擅长从非结构化文本中抽取结构化信息，并转换为 Neo4j 图数据库的 Cypher 查询语言。
+        return f"""
+    你正在解析工业设备维修作业标准文档的。请从以下文本中抽取结构化知识，并构建一个完整的知识图谱。
 
-## 背景与目标
-我将提供一段文本内容，你的任务是：
-1.  **精确地抽取出知识图谱的核心要素**：
-    *   **实体 (Entities/Nodes)**： 识别出文本中提及的人、地点、组织、产品、事件等主要对象。
-    *   **关系 (Relationships/Edges)**： 识别出实体之间的具体关系。关系必须是有向的，并用一个清晰的动词或动词短语描述（如 `隶属于`, `出生于`, `投资了`, `发布了`）。
-    *   **属性 (Properties)**： 识别出实体或关系的关键属性（如 人物的`年龄`、公司的`市值`、关系的`开始时间`）。
-    *   **约束 (Constraints)**： 推断出实体的**标签 (Labels)**和关系的**类型 (Type)**。
+    ## 文档结构指南：
+    1. 项目基本信息：名称、编码、工期、危险源、动火等级等通常在文档顶部。
+    2. 资源需求：工具列表通常标记为"需用工机具"，材料列表标记为"需用材料"。
+    3. 人员配置：通常在"需要人数"或"工种代码"部分。
+    4. 活动流程：按事件顺序排列的活动，包含描述、工时、作业方法和安全措施并包含一个工序所需的人员和材料，这是非常重要的关系。
 
-## 可用的实体类型
-请使用以下预定义的实体类型（**必须使用小写格式**）：
-- **equipment**: 设备、机器、装置
-- **component**: 部件、组件、零件
-- **procedure**: 工序、流程、操作步骤
-- **standard**: 标准、规范、要求
-- **material**: 材料、物质、原料
-- **condition**: 条件、状态、情况
-- **error**: 错误、故障、问题
-- **cause**: 原因、起因
-- **solution**: 解决方案、方法
-- **maintenance**: 维修、保养
-- **inspection**: 检查、检验
-- **person**: 人员、操作员、技术人员
-- **tool**: 工具、仪器、设备
-- **location**: 位置、地点、场所
-- **time**: 时间、日期、周期
-- **other**: 其他类型
+    ## 特殊处理规则：
+    - 工具ID格式：字母编号（如 A、B、C）或数字编号。
+    - 工时单位统一转换为小时（h）。
+    - 日期格式统一为 YYYY-MM-DD。
+    - 人员代码保留原始格式（如 QG1、QZG2）。
 
-**重要提示**：实体类型必须使用小写格式，如：tool、person、equipment，不要使用Tool、Person、Equipment等大写格式。
+    ## 数据验证要求：
+    - 工具/材料引用必须存在于资源列表中。
+    - 所有实体必须有唯一 ID。
+    - 每个关系的 source 和 target 必须指向 entities 中的合法 ID。
 
-## 可用的关系类型
-请使用以下预定义的关系类型（**必须使用小写格式**）：
-- **part_of**: 是...的一部分
-- **used_in**: 用于...
-- **related_to**: 与...相关
-- **causes**: 导致
-- **is_solution_for**: 是...的解决方案
-- **requires**: 需要...
-- **results_in**: 导致...
-- **checked_by**: 被...检查
-- **maintained_by**: 被...维护
-- **follows**: 遵循...
-- **depends_on**: 依赖于...
-- **compiled_by**: 由...编译/编制
-- **created_by**: 由...创建
-- **operated_by**: 由...操作
-- **located_in**: 位于...
-- **contains**: 包含
-- **belongs_to**: 属于
-- **connects_to**: 连接到
-- **replaces**: 替换
-- **improves**: 改善
-- **prevents**: 防止
-- **other**: 其他
+    ## 关系完整性要求（重点）：
+    - 所有实体之间的依赖关系必须完整解析，不允许遗漏。
+    - 至少包括以下常见关系：
+    - 项目需要工具/材料/人员（require）
+    - 工序依赖前序工序（depends_on）
+    - 工序与项目的关联（part_of）
+    - 工序与材料工具人员的关联（used_in）
+    - 项目与危险源的关联（attention_to）
+    - 如果发现潜在的依赖或引用关系，必须显式写入 relations。
 
-**重要提示**：关系类型必须使用小写格式，如：part_of、used_in、related_to，不要使用Part_Of、Used_In、Related_To等大写格式。
+    ## 关系构建硬性要求：
+    1. 任何实体如果在文本中存在依赖、引用或使用关系，必须显式生成一个 Relation。
+    2. Relation 的 source 和 target 必须对应 entities 中已存在的 ID。
+    3. 每个工序（procedure）必须至少有：
+    - 一个 "part_of" 指向所属项目
+    - 所需的工具/材料/人员的 "requires" 或 "used_in"
+    - 前序工序（如果有）的 "depends_on"
+    4. 如果文本中隐含了引用关系（例如工序提到“使用工具 A”），也必须转化为一个 Relation。
+    5. 如果不确定关系类型，使用 "related_to"，绝对不能省略。
 
-2.  **生成对应的 Cypher 语句**：
-    *   根据抽取出的信息，生成用于创建该知识图谱的 Cypher `MERGE` 语句。
-    *   `MERGE` 语句用于确保节点和关系的唯一性（如果不存在则创建，存在则匹配）。
-    *   为实体分配合适的标签，为关系指定类型。
-    *   将属性添加到对应的节点和关系中。
+    ## 输出格式要求：
+    严格输出为以下格式（可直接被解析为 KnowledgeGraph 对象）：
+    {format_instructions}
 
-## 输出格式要求
-你必须严格按照以下 JSON 格式输出结果，不要有任何额外的解释或说明：
-
-{{
-  "entities": [
-    {{
-      "id": "唯一的标识符（可使用实体名称）",
-      "name": "实体名称",
-      "type": "实体类型（必须使用预定义的类型：equipment, component, procedure, standard, material, condition, error, cause, solution, maintenance, inspection, person, tool, location, time, other）",
-      "properties": {{"属性键": "属性值", ...}}
-    }},
-    ...
-  ],
-  "relations": [
-    {{
-      "from": "起始实体id",
-      "to": "指向实体id",
-      "type": "关系类型（如 WORKS_FOR, FOUNDED, LOCATED_IN等）",
-      "properties": {{"属性键": "属性值", ...}}
-    }},
-    ...
-  ],
-  "cypher_statements": [
-    "// 注释说明",
-    "MERGE (a:Label {{name: '实体名称'}}) ON CREATE SET a += {{properties}};",
-    "MERGE (b:Label {{name: '实体名称'}}) ON CREATE SET b += {{properties}};",
-    "MERGE (a)-[r:RELATIONSHIP_TYPE]->(b) ON CREATE SET r += {{properties}};",
-    ...
-  ]
-}}
-
-## 处理原则与约束
-- **实体消歧**： 如果同一实体以不同名称出现（如"苹果"和"Apple Inc."），请将它们归一化为一个标准名称，并使用相同的 `id`。
-- **关系明确性**： 关系必须是有方向的，并且类型使用英文大写蛇形命名（如 `IS_FRIEND_OF`）。
-- **属性类型**： 尽量推断属性的数据类型（如数字、字符串、布尔值），并在 Cypher 语句中正确表示（字符串用引号，数字不用）。
-- **优先使用 MERGE**： 使用 `MERGE` 而非 `CREATE` 来避免重复创建相同节点和关系。
-- **简洁性**： 只抽取关键信息，忽略不重要的细节。
-
-## 文本内容
-{content}
-"""
+    文档内容：
+    {content}
+    """
 
     def _parse_llm_response(self, response_text: str) -> Dict[str, Any]:
         """

@@ -22,8 +22,8 @@ class GraphService:
         self.settings = settings
         self._driver: Optional[Driver] = None
         self._driver = GraphDatabase.driver(
-            self.settings.neo4j_uri,
-            auth=(self.settings.neo4j_username, self.settings.neo4j_password),
+            self.settings.neo4j_uri_2,
+            auth=(self.settings.neo4j_username_2, self.settings.neo4j_password_2),
         )
 
     def close(self) -> None:

@@ -1,7 +1,7 @@
 """
 知识图谱模型
 """
-
+from pydantic import RootModel
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from enum import Enum
@@ -23,12 +23,13 @@ class EntityType(str, Enum):
     SOLUTION = "solution"        # 解决方案
     MAINTENANCE = "maintenance"  # 维修
     INSPECTION = "inspection"    # 检查
-    PERSON = "person"            # 人员
+    ROLE = "role"                # 人员
     TOOL = "tool"                # 工具
     LOCATION = "location"        # 位置
     TIME = "time"                # 时间
     OTHER = "other"              # 其他
-
+    HAZARD = "hazard_sources"    # 危险源             
+    PROJECT = "project"
 
 class RelationType(str, Enum):
     """关系类型枚举"""
@@ -53,7 +54,30 @@ class RelationType(str, Enum):
     REPLACES = "replaces"        # 替换
     IMPROVES = "improves"        # 改善
     PREVENTS = "prevents"        # 防止
+    ATTENTION_TO = "attention_to"  # 注意
     OTHER = "other"              # 其他
+
+
+
+class EntityLLM(BaseModel):
+    """知识图谱实体模型"""
+
+    # 基本字段
+    id: str = Field(..., description="实体唯一标识")
+    name: str = Field(..., description="实体名称")
+    type: EntityType = Field(..., description="实体类型")
+    description: Optional[str] = Field(None, description="实体描述")
+    # 属性
+    properties: Dict[str, Any] = Field(default_factory=dict, description="实体属性")
+
+    # 标准化信息
+    normalized_name: Optional[str] = Field(None, description="标准化名称")
+
+    class Config:
+        json_encoders = {
+            datetime: format_timestamp,
+            EntityType: lambda v: v.value
+        }
 
 
 class Entity(BaseModel):
@@ -155,7 +179,27 @@ class Entity(BaseModel):
             properties = f", {properties}"
 
         return f"CREATE (e:{self.type.value} {{id: '{self.id}', name: '{self.name}'{properties}}})"
+class EntityList(RootModel[List[EntityLLM]]):
+    pass
 
+class RelationLLM(BaseModel):
+    """知识图谱关系模型"""
+
+    # 基本字段
+    id: str = Field(..., description="关系唯一标识")
+    type: RelationType = Field(..., description="关系类型")
+    source: str = Field(..., description="源实体ID")
+    target: str = Field(..., description="目标实体ID")
+
+    #description: Optional[str] = Field(None, description="关系描述")
+
+    #properties: Dict[str, Any] = Field(default_factory=dict, description="关系属性")
+
+    class Config:
+        json_encoders = {
+            datetime: format_timestamp,
+            RelationType: lambda v: v.value
+        }
 
 class Relation(BaseModel):
     """知识图谱关系模型"""
@@ -241,6 +285,8 @@ class Relation(BaseModel):
 
         return f"CREATE (e1)-[:{self.type.value} {{id: '{self.id}'{properties}}}]->(e2)"
 
+class RelationList(RootModel[List[RelationLLM]]):
+    pass
 
 class KnowledgeGraph(BaseModel):
     """知识图谱模型"""
@@ -452,3 +498,86 @@ class KnowledgeGraph(BaseModel):
                         merged.add_relation(new_relation)
 
         return merged
+
+
+class Tool(BaseModel):
+    id: str = Field(..., description="工具唯一标识")
+    name: str = Field(..., description="工具名称")
+    quantity: float = Field(..., description="工具数量")
+    unit: str = Field(..., description="工具单位")
+
+
+class Material(BaseModel):
+    id: str = Field(..., description="材料唯一标识")
+    name: str = Field(..., description="材料名称")
+    quantity: float = Field(..., description="材料数量")
+    unit: str = Field(..., description="材料单位")
+
+
+class Machine(BaseModel):
+    id: str = Field(..., description="机械设备唯一标识")
+    name: str = Field(..., description="机械设备名称")
+    model: Optional[str] = Field(None, description="设备型号")
+    quantity: float = Field(..., description="设备数量")
+    unit: str = Field(..., description="设备单位")
+
+
+class Activity(BaseModel):
+    start_event: int = Field(..., description="工序起始事件编号")
+    end_event: int = Field(..., description="工序结束事件编号")
+    description: str = Field(..., description="工序描述")
+    duration: Optional[float] = Field(None, description="工序持续时间（小时）")
+    method: Optional[str] = Field(None, description="作业方法")
+    safety_measures: Optional[str] = Field(None, description="安全措施")
+    technical_points: Optional[str] = Field(None, description="技术要点")
+    tools: List[str] = Field(default_factory=list, description="工序使用的工具ID列表")
+    materials: List[str] = Field(default_factory=list, description="工序使用的材料ID列表")
+    personnel: List[str] = Field(default_factory=list, description="参与人员代码列表")
+    dependencies: List[int] = Field(default_factory=list, description="前置工序ID列表")
+    checkpoints: List[str] = Field(default_factory=list, description="检查/验收点")
+
+
+class RepairStandard(BaseModel):
+    """工业设备维修作业标准文档的结构化模型"""
+
+    # 基本信息
+    project_name: str = Field(..., description="项目名称")
+    project_code: str = Field("", description="项目编码")
+    project_type: Optional[str] = Field(None, description="项目类型（检修/维护/改造等）")
+    location: Optional[str] = Field(None, description="施工地点或工区")
+
+    # 时间和工期
+    duration: float = Field(..., description="总工期（小时）")
+    creation_date: str = Field(..., description="文档创建日期（YYYY-MM-DD）")
+    modification_date: str = Field(..., description="文档修改日期（YYYY-MM-DD）")
+
+    # 安全与风险
+    hazards: List[str] = Field(..., description="危险源列表")
+    fire_level: str = Field(..., description="动火等级")
+    safety_level: Optional[str] = Field(None, description="安全等级")
+    permits: List[str] = Field(default_factory=list, description="所需作业许可（如动火证、高处作业证等）")
+    ppe: List[str] = Field(default_factory=list, description="所需个人防护装备列表")
+
+    # 人员与工时
+    labor_hours: float = Field(..., description="总工时（小时）")
+    personnel: Dict[str, List[str]] = Field(..., description="人员配置，键为工种代码，值为人员ID列表")
+
+    # 资源
+    tools: List[Tool] = Field(..., description="所需工具列表")
+    materials: List[Material] = Field(..., description="所需材料列表")
+    machines: List[Machine] = Field(default_factory=list, description="所需机械设备列表")
+
+    # 工序
+    processes: List[Activity] = Field(..., description="工序流程列表")
+
+    # 部门与设备位置
+    department: str = Field(..., description="所属部门")
+    plant: str = Field(..., description="所属工厂")
+    equipment_area: str = Field(..., description="设备区域")
+
+    # 元信息
+    file_hash: Optional[str] = Field(None, description="文件哈希值，用于校验")
+    file_name: Optional[str] = Field(None, description="文件名称")
+    process_date: Optional[str] = Field(None, description="处理日期")
+    
+    
