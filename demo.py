@@ -73,7 +73,18 @@ def create_app():
     graph_service = GraphService(settings)
 
     # 定义应用布局
-    with gr.Blocks(title="维标管理工具") as app:
+    with gr.Blocks(
+    title="维标管理工具",
+    css="""
+    #extraction_doc_checkbox {
+        max-height: 300px;
+        overflow-y: auto;
+        border: 1px solid #ddd;
+        padding: 8px;
+    }
+    """
+    ) as app:
+
         # 顶部标题
         gr.Markdown("# 维标管理工具")
 
@@ -101,7 +112,7 @@ def create_app():
                     with gr.Column(scale=2):
                         gr.Markdown("## 文档列表")
                         # 文档列表复选框组
-                        document_checkbox = gr.CheckboxGroup([], label="选择文档", interactive=True)
+                        document_checkbox = gr.CheckboxGroup([], label="选择文档", interactive=True, elem_id="doc_checkbox_extract")
                         # 文档操作按钮
                         with gr.Row():
                             with gr.Column():
@@ -136,7 +147,7 @@ def create_app():
                     with gr.Column():
                         gr.Markdown("## 选择要抽取的文档")
                         # 知识抽取用的文档选择器（与文档管理选项卡同步）
-                        extraction_document_checkbox = gr.CheckboxGroup([], label="选择文档进行知识抽取", interactive=True)
+                        extraction_document_checkbox = gr.CheckboxGroup([], label="选择文档进行知识抽取", interactive=True, elem_id="extraction_doc_checkbox")
                         refresh_docs_button = gr.Button("刷新文档列表")
                 
                 # 抽取配置区域
@@ -163,6 +174,7 @@ def create_app():
                             label="超时时间(秒)"
                         )
                         extract_button = gr.Button("开始抽取")
+                        save_kg_button = gr.Button("保存知识图谱")
 
                     with gr.Column(scale=2):
                         gr.Markdown("## 抽取状态")
@@ -276,17 +288,17 @@ def create_app():
                 logger.error(f"上传文档失败: {str(e)}")
                 return [], {}, f"上传失败: {str(e)}"
 
-        def upload_folder(folder):
+        def upload_folder(files):
             """上传文件夹"""
-            if not folder:
+            if not files:
                 return [], {}, "请选择要上传的文件夹"
 
             try:
                 # 转换为Path对象
-                folder_path = Path(folder.name)
+                file_paths = [Path(f.name) for f in files]
 
-                # 上传文件夹中的文档
-                documents = document_service.upload_folder(folder_path)
+                documents = document_service.upload_documents(file_paths)
+
 
                 # 更新文档列表
                 choices, stats = update_document_list()
@@ -300,7 +312,7 @@ def create_app():
             """更新文档列表"""
             try:
                 # 获取文档列表
-                documents, total = document_service.list_documents()
+                documents, total = document_service.list_documents(page=1,page_size=1000)
 
                 # 准备复选框选项
                 choices = []
@@ -426,7 +438,7 @@ def create_app():
             """同步文档列表到知识抽取选项卡"""
             try:
                 choices, _ = update_document_list()
-                return gr.CheckboxGroup(choices=choices, value=[], interactive=True)
+                return gr.update(choices=choices, value=[])
             except Exception as e:
                 logger.error(f"同步文档列表失败: {str(e)}")
                 return gr.CheckboxGroup([], interactive=True)
@@ -489,43 +501,114 @@ def create_app():
                 cypher_text = "\n".join(cypher_statements) if cypher_statements else "暂无Cypher语句生成"
                 
                 # 同步更新两个文档选择器
-                extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
+                extraction_choices = gr.update(choices=choices, value=[])
+                 # 将 results（可能包含 KnowledgeGraph 对象）序列化为 JSON-serializable 结构
+                kg_serializable = {}
+                try:
+                    from models.knowledge import KnowledgeGraph
+                except Exception:
+                    KnowledgeGraph = None
+
+                for doc_id, kg in results.items():
+                    if kg is None:
+                        kg_serializable[doc_id] = None
+                    else:
+                        # 如果是 KnowledgeGraph 实例，使用 to_dict()
+                        if KnowledgeGraph is not None and isinstance(kg, KnowledgeGraph):
+                            try:
+                                kg_serializable[doc_id] = kg.to_dict()
+                            except Exception:
+                                # 回退为字符串表示
+                                kg_serializable[doc_id] = str(kg)
+                        else:
+                            # 如果是 dict/list 等可序列化类型，尽量直接使用
+                            try:
+                                import json
+                                json.dumps(kg)
+                                kg_serializable[doc_id] = kg
+                            except Exception:
+                                kg_serializable[doc_id] = str(kg)
+
+                # 返回使用 gr.update 更新已有的 CheckboxGroup 组件，而不是创建新组件对象
                 
-                return choices, extraction_choices, extraction_stats, cypher_text, f"知识抽取完成！成功处理 {len(results)} 个文档，抽取 {entity_count} 个实体，{relation_count} 个关系"
+                return choices, extraction_choices, extraction_stats, cypher_text, f"知识抽取完成！成功处理 {len(results)} 个文档，抽取 {entity_count} 个实体，{relation_count} 个关系",kg_serializable
                 
             except Exception as e:
                 logger.error(f"知识抽取失败: {str(e)}")
                 choices, stats = update_document_list()
-                extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
-                return choices, extraction_choices, {}, "", f"抽取失败: {str(e)}"
+                return (
+                        gr.update(choices=choices, value=[]),
+                        gr.update(choices=choices, value=[]),
+                        {},
+                        "",
+                        f"抽取失败: {str(e)}",
+                        {}
+                    )
+
 
             # 绑定事件
 
+        def save_knowledge_graph():
+            """保存当前知识图谱"""
+            try:
+                kg_id = knowledge_service.save_knowledge_graph()
+                if kg_id:
+                    return f"知识图谱已保存，ID: {kg_id}"
+                else:
+                    return "没有可保存的知识图谱"
+            except Exception as e:
+                logger.error(f"保存知识图谱失败: {str(e)}")
+                return f"保存失败: {str(e)}"
+            
         # 文档管理操作的事件绑定（同时更新两个文档选择器）
         def sync_upload_documents(files):
             choices, stats, message = upload_documents(files)
-            extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
-            return choices, extraction_choices, stats, message
+            return (
+                    gr.update(choices=choices, value=[]),
+                    gr.update(choices=choices, value=[]),
+                    stats,
+                    message
+                    )
+
             
         def sync_upload_folder(folder):
             choices, stats, message = upload_folder(folder)
-            extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
-            return choices, extraction_choices, stats, message
+            return (
+                    gr.update(choices=choices, value=[]),
+                    gr.update(choices=choices, value=[]),
+                    stats,
+                    message
+                    )
+
             
         def sync_rename_document(selected_choices, new_name):
             choices, stats, message = rename_document(selected_choices, new_name)
-            extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
-            return choices, extraction_choices, stats, message
+            return (
+                    gr.update(choices=choices, value=[]),
+                    gr.update(choices=choices, value=[]),
+                    stats,
+                    message
+                    )
+
             
         def sync_clean_document(selected_choices):
             choices, stats, message = clean_document(selected_choices)
-            extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
-            return choices, extraction_choices, stats, message
+            return (
+                    gr.update(choices=choices, value=[]),
+                    gr.update(choices=choices, value=[]),
+                    stats,
+                    message
+                    )
+
             
         def sync_delete_document(selected_choices):
             choices, stats, message = delete_document(selected_choices)
-            extraction_choices = gr.CheckboxGroup(choices=choices, value=[], interactive=True)
-            return choices, extraction_choices, stats, message
+            return (
+                    gr.update(choices=choices, value=[]),
+                    gr.update(choices=choices, value=[]),
+                    stats,
+                    message
+                    )
 
         upload_button.click(sync_upload_documents, inputs=[file_upload], outputs=[document_checkbox, extraction_document_checkbox, document_stats, gr.Textbox(label="上传状态")])
         upload_folder_button.click(sync_upload_folder, inputs=[folder_upload], outputs=[document_checkbox, extraction_document_checkbox, document_stats, gr.Textbox(label="上传状态")])
@@ -604,9 +687,12 @@ def create_app():
         extract_button.click(
             extract_knowledge, 
             inputs=[extraction_document_checkbox, model_name, concurrency, timeout], 
-            outputs=[document_checkbox, extraction_document_checkbox, extraction_stats, cypher_output, gr.Textbox(label="抽取状态")]
+            outputs=[document_checkbox, extraction_document_checkbox, extraction_stats, cypher_output, gr.Textbox(label="抽取状态"), extraction_results]
         )
 
+        cypher_copy_button.click(
+
+        )
         write_neo4j_button.click(
             write_neo4j,
             inputs=[cypher_output],
